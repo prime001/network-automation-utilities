@@ -1,0 +1,280 @@
+```python
+#!/usr/bin/env python3
+"""
+config_compliance_checker.py — Network Device Configuration Compliance Validator
+
+Reads raw network device configuration files and validates them against a
+set of best-practice rules. Detects missing security settings, undocumented
+interfaces, weak credentials, and non-compliant configurations.
+
+Real-world use cases:
+  - Pre-deployment compliance audits before configs reach production
+  - Catch missing AAA, NTP, syslog settings at scale
+  - Identify interfaces without descriptions for audit trails
+  - Enforce password policies and SNMP community string security
+
+Usage:
+    python config_compliance_checker.py running-config.txt
+    python config_compliance_checker.py --format json running-config.txt
+    python config_compliance_checker.py --rules strict running-config.txt
+
+Config file format (Cisco IOS/IOS-XE example):
+    hostname router1
+    !
+    interface GigabitEthernet0/0/1
+     description Link to Core-1
+     ip address 192.168.1.1 255.255.255.0
+    !
+    ip route 0.0.0.0 0.0.0.0 192.168.1.254
+    !
+    logging 10.0.0.1
+    ntp server 10.0.0.2
+
+Exit codes:
+    0  — all rules pass
+    1  — one or more rules failed
+    2  — fatal error (unreadable file, invalid format)
+
+Requires Python 3.7+ (standard library only).
+"""
+
+import argparse
+import json
+import re
+import sys
+from typing import List, Dict, Tuple
+
+
+class ConfigComplianceChecker:
+    """Validates network device configs against compliance rules."""
+
+    def __init__(self, ruleset: str = "standard"):
+        self.ruleset = ruleset
+        self.rules = self._load_rules()
+
+    def _load_rules(self) -> List[Dict]:
+        """Load rule definitions based on ruleset level."""
+        base_rules = [
+            {
+                "name": "hostname_configured",
+                "pattern": r"^\s*hostname\s+(\S+)",
+                "severity": "high",
+                "description": "Device must have a hostname defined",
+                "required": True,
+            },
+            {
+                "name": "logging_configured",
+                "pattern": r"^\s*logging\s+\S+",
+                "severity": "high",
+                "description": "Syslog destination must be configured",
+                "required": True,
+            },
+            {
+                "name": "ntp_configured",
+                "pattern": r"^\s*ntp\s+server\s+\S+",
+                "severity": "medium",
+                "description": "NTP server must be configured for time sync",
+                "required": True,
+            },
+            {
+                "name": "aaa_new_model",
+                "pattern": r"^\s*aaa\s+new-model",
+                "severity": "high",
+                "description": "AAA must be enabled for centralized auth",
+                "required": True,
+            },
+            {
+                "name": "no_default_snmp_community",
+                "pattern": r"^\s*snmp-server\s+community\s+(?:public|private)",
+                "severity": "critical",
+                "description": "Default SNMP communities (public/private) must not be used",
+                "required": False,
+                "should_not_match": True,
+            },
+            {
+                "name": "enable_password_set",
+                "pattern": r"^\s*enable\s+(?:password|secret)\s+",
+                "severity": "high",
+                "description": "Enable password/secret must be configured",
+                "required": True,
+            },
+        ]
+
+        if self.ruleset == "strict":
+            base_rules.extend([
+                {
+                    "name": "snmp_server_location",
+                    "pattern": r"^\s*snmp-server\s+location\s+\S+",
+                    "severity": "medium",
+                    "description": "SNMP location string improves device tracking",
+                    "required": True,
+                },
+                {
+                    "name": "interface_description_required",
+                    "pattern": None,
+                    "custom": "interfaces_have_descriptions",
+                    "severity": "medium",
+                    "description": "All interfaces must have descriptions",
+                    "required": True,
+                },
+                {
+                    "name": "no_telnet",
+                    "pattern": r"^\s*line\s+vty",
+                    "severity": "critical",
+                    "description": "Telnet (line vty) should be restricted or removed",
+                    "required": False,
+                    "should_not_match": True,
+                },
+            ])
+
+        return base_rules
+
+    def check_interfaces_have_descriptions(self, content: str) -> bool:
+        """Verify that all configured interfaces have descriptions."""
+        interface_pattern = r"^\s*interface\s+(\S+)"
+        description_pattern = r"^\s*description\s+(\S.*)"
+        
+        lines = content.split("\n")
+        in_interface = False
+        current_interface = None
+        interfaces_with_desc = set()
+        all_interfaces = set()
+        
+        for line in lines:
+            if re.match(interface_pattern, line):
+                match = re.match(interface_pattern, line)
+                current_interface = match.group(1)
+                all_interfaces.add(current_interface)
+                in_interface = True
+            elif in_interface and re.match(description_pattern, line):
+                if current_interface:
+                    interfaces_with_desc.add(current_interface)
+                in_interface = False
+            elif in_interface and line.startswith(" ") and not line.strip().startswith("!"):
+                continue
+            elif line.startswith(" "):
+                in_interface = False
+
+        # Management interfaces like Loopback0 don't require descriptions in strict mode
+        loopback_only = all(iface.startswith("Loopback") for iface in all_interfaces)
+        return len(all_interfaces) == 0 or loopback_only or len(interfaces_with_desc) == len(all_interfaces)
+
+    def validate(self, content: str) -> List[Dict]:
+        """Run all rules against config content. Return list of findings."""
+        findings = []
+
+        for rule in self.rules:
+            if "custom" in rule:
+                passed = getattr(self, rule["custom"])(content)
+                finding = {
+                    "rule": rule["name"],
+                    "description": rule["description"],
+                    "severity": rule["severity"],
+                    "passed": passed,
+                }
+            else:
+                pattern = rule.get("pattern")
+                if not pattern:
+                    continue
+
+                matches = re.findall(pattern, content, re.MULTILINE)
+                should_not_match = rule.get("should_not_match", False)
+
+                if should_not_match:
+                    passed = len(matches) == 0
+                else:
+                    passed = len(matches) > 0
+
+                finding = {
+                    "rule": rule["name"],
+                    "description": rule["description"],
+                    "severity": rule["severity"],
+                    "passed": passed,
+                    "matches_found": len(matches),
+                }
+
+            findings.append(finding)
+
+        return findings
+
+
+def render_table(findings: List[Dict]) -> None:
+    """Render findings as human-readable table."""
+    print("\n" + "=" * 80)
+    print("Compliance Audit Results".center(80))
+    print("=" * 80 + "\n")
+    
+    cols = [
+        ("Rule", "rule", 30),
+        ("Severity", "severity", 12),
+        ("Status", None, 8),
+    ]
+    
+    header = "  ".join(label.ljust(w) for label, _, w in cols)
+    sep = "  ".join("-" * w for _, _, w in cols)
+    print(header)
+    print(sep)
+    
+    for finding in findings:
+        status = "✓ PASS" if finding["passed"] else "✗ FAIL"
+        vals = [
+            finding["rule"].ljust(30),
+            finding["severity"].ljust(12),
+            status.ljust(8),
+        ]
+        print("  ".join(vals))
+        print(f"    → {finding['description']}")
+    
+    passed = sum(1 for f in findings if f["passed"])
+    total = len(findings)
+    print(f"\nResult: {passed}/{total} checks passed\n")
+
+
+def render_json(findings: List[Dict]) -> None:
+    """Output findings as JSON."""
+    print(json.dumps(findings, indent=2))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Validate network device configuration against compliance rules.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("config_file", help="Device config file to validate")
+    ap.add_argument(
+        "--rules",
+        choices=["standard", "strict"],
+        default="standard",
+        help="Rule severity level (standard=basic, strict=enhanced)",
+    )
+    ap.add_argument(
+        "--format",
+        choices=["table", "json"],
+        default="table",
+        help="Output format",
+    )
+    
+    args = ap.parse_args()
+
+    try:
+        with open(args.config_file) as fh:
+            content = fh.read()
+    except OSError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    checker = ConfigComplianceChecker(ruleset=args.rules)
+    findings = checker.validate(content)
+
+    if args.format == "json":
+        render_json(findings)
+    else:
+        render_table(findings)
+
+    failed = sum(1 for f in findings if not f["passed"])
+    return 1 if failed > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
