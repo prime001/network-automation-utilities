@@ -1,0 +1,152 @@
+The task is to generate standalone file content for a separate portfolio repo. Writing directly:
+
+#!/usr/bin/env python3
+"""
+012_textfsm_tester.py — TextFSM template tester for network device output.
+
+Iteratively develop TextFSM templates by testing them against captured
+device output before wiring them into a pipeline. Prints a formatted table
+of parsed records and validates template syntax, saving debugging cycles.
+
+Dependencies:
+    pip install textfsm tabulate
+
+Usage:
+    python 012_textfsm_tester.py template.textfsm device_output.txt
+    python 012_textfsm_tester.py template.textfsm device_output.txt --json
+    python 012_textfsm_tester.py --demo
+
+Example (demo ships embedded Cisco IOS 'show ip interface brief' data):
+    python 012_textfsm_tester.py --demo
+"""
+
+import sys
+import json
+import argparse
+import io
+import textwrap
+
+try:
+    import textfsm
+except ImportError:
+    sys.exit("Missing dependency: pip install textfsm")
+
+try:
+    from tabulate import tabulate
+    _HAS_TABULATE = True
+except ImportError:
+    _HAS_TABULATE = False
+
+
+# ---------------------------------------------------------------------------
+# Embedded demo data — Cisco IOS 'show ip interface brief'
+# ---------------------------------------------------------------------------
+
+_DEMO_TEMPLATE = textwrap.dedent(r"""
+    Value INTERFACE (\S+)
+    Value IP_ADDRESS ([\d.]+|unassigned)
+    Value METHOD (\S+)
+    Value STATUS (up|down|administratively down)
+    Value PROTOCOL (up|down)
+
+    Start
+      ^\s*${INTERFACE}\s+${IP_ADDRESS}\s+${METHOD}\s+\w+\s+${STATUS}\s+${PROTOCOL} -> Record
+""").lstrip()
+
+_DEMO_INPUT = textwrap.dedent("""\
+    Interface              IP-Address      OK? Method Status                Protocol
+    GigabitEthernet0/0     192.168.1.1     YES manual up                    up
+    GigabitEthernet0/1     10.0.0.1        YES manual up                    up
+    GigabitEthernet0/2     unassigned      YES unset  administratively down down
+    GigabitEthernet0/3     172.16.0.1      YES NVRAM  up                    up
+    Loopback0              1.1.1.1         YES manual up                    up
+    Loopback1              unassigned      YES unset  down                  down
+""")
+
+
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
+
+def parse(template_text: str, raw_output: str) -> tuple:
+    """Run raw_output through template_text; return (headers, rows)."""
+    try:
+        fsm = textfsm.TextFSM(io.StringIO(template_text))
+    except textfsm.TextFSMTemplateError as exc:
+        sys.exit(f"Template syntax error: {exc}")
+    try:
+        rows = fsm.ParseText(raw_output)
+    except textfsm.TextFSMError as exc:
+        sys.exit(f"Parse error: {exc}")
+    return fsm.header, rows
+
+
+def _simple_table(headers: list, rows: list) -> str:
+    """Fallback table renderer when tabulate is not installed."""
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(str(cell)))
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    sep = "  ".join("-" * w for w in widths)
+    lines = [fmt.format(*headers), sep]
+    for row in rows:
+        lines.append(fmt.format(*[str(c) for c in row]))
+    return "\n".join(lines)
+
+
+def render_table(headers: list, rows: list) -> str:
+    if _HAS_TABULATE:
+        return tabulate(rows, headers=headers, tablefmt="simple")
+    return _simple_table(headers, rows)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("template", nargs="?", help="TextFSM template file")
+    ap.add_argument("input", nargs="?", help="Device output file (stdin if omitted)")
+    ap.add_argument("--demo", action="store_true", help="Run built-in demo")
+    ap.add_argument("--json", dest="as_json", action="store_true", help="Emit JSON")
+    args = ap.parse_args()
+
+    if args.demo:
+        template_text = _DEMO_TEMPLATE
+        raw_output = _DEMO_INPUT
+        print("── Template ─────────────────────────────────────────────")
+        print(_DEMO_TEMPLATE)
+        print("── Input ────────────────────────────────────────────────")
+        print(_DEMO_INPUT)
+        print("── Result ───────────────────────────────────────────────")
+    else:
+        if not args.template:
+            ap.error("Provide a template file or use --demo")
+        with open(args.template) as fh:
+            template_text = fh.read()
+        if args.input:
+            with open(args.input) as fh:
+                raw_output = fh.read()
+        else:
+            raw_output = sys.stdin.read()
+
+    headers, rows = parse(template_text, raw_output)
+
+    if not rows:
+        print("No records matched.")
+        return
+
+    if args.as_json:
+        print(json.dumps([dict(zip(headers, row)) for row in rows], indent=2))
+    else:
+        print(render_table(headers, rows))
+        print(f"\n{len(rows)} record(s) parsed.")
+
+
+if __name__ == "__main__":
+    main()
