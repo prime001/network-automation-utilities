@@ -1,0 +1,208 @@
+The `network-automation-utilities` repo doesn't exist locally — the instructions ask for the file content as output. Here it is:
+
+#!/usr/bin/env python3
+"""
+017_interface_config_generator.py
+
+Multi-vendor interface configuration generator using embedded Jinja2 templates.
+Converts a single structured port-plan into production-ready CLI config for
+Cisco IOS, Arista EOS, and Juniper JunOS — eliminating per-vendor copy-paste
+and ensuring consistent standards across a mixed-vendor access layer.
+
+Real-world use cases:
+  - Provisioning new access-layer switches from a rack elevation spreadsheet
+  - Bulk-standardizing switchport descriptions after a port audit
+  - Generating change-window config snippets for peer review
+
+Dependencies: jinja2 (pip install jinja2)
+
+Usage:
+    python 017_interface_config_generator.py            # runs built-in example
+    python 017_interface_config_generator.py cisco_ios  # single vendor only
+"""
+
+import sys
+from dataclasses import dataclass, field
+from typing import Optional
+
+from jinja2 import BaseLoader, Environment, StrictUndefined
+
+# ---------------------------------------------------------------------------
+# Vendor templates
+# ---------------------------------------------------------------------------
+
+_CISCO_IOS = """\
+{% for iface in interfaces -%}
+interface {{ iface.name }}
+ description {{ iface.description }}
+{% if iface.mode == 'access' %}
+ switchport mode access
+ switchport access vlan {{ iface.vlan }}
+{% elif iface.mode == 'trunk' %}
+ switchport mode trunk
+ switchport trunk native vlan {{ iface.native_vlan }}
+{% if iface.allowed_vlans %}
+ switchport trunk allowed vlan {{ iface.allowed_vlans | join(',') }}
+{% endif %}
+{% endif %}
+{% if iface.portfast %} spanning-tree portfast
+{% endif %}
+{% if iface.bpduguard %} spanning-tree bpduguard enable
+{% endif %}
+{% if iface.shutdown %} shutdown
+{% else %} no shutdown
+{% endif %}
+!
+{% endfor %}"""
+
+_ARISTA_EOS = """\
+{% for iface in interfaces -%}
+interface {{ iface.name }}
+   description {{ iface.description }}
+{% if iface.mode == 'access' %}
+   switchport mode access
+   switchport access vlan {{ iface.vlan }}
+{% elif iface.mode == 'trunk' %}
+   switchport mode trunk
+   switchport trunk native vlan {{ iface.native_vlan }}
+{% if iface.allowed_vlans %}
+   switchport trunk allowed vlan {{ iface.allowed_vlans | join(',') }}
+{% endif %}
+{% endif %}
+{% if iface.portfast %}   spanning-tree portfast
+{% endif %}
+{% if iface.bpduguard %}   spanning-tree bpduguard enable
+{% endif %}
+{% if iface.shutdown %}   shutdown
+{% else %}   no shutdown
+{% endif %}
+!
+{% endfor %}"""
+
+_JUNIPER_JUNOS = """\
+{% for iface in interfaces -%}
+set interfaces {{ iface.name }} description "{{ iface.description }}"
+{% if iface.mode == 'access' -%}
+set interfaces {{ iface.name }} unit 0 family ethernet-switching interface-mode access
+set interfaces {{ iface.name }} unit 0 family ethernet-switching vlan members vlan{{ iface.vlan }}
+{% elif iface.mode == 'trunk' -%}
+set interfaces {{ iface.name }} unit 0 family ethernet-switching interface-mode trunk
+{% for v in iface.allowed_vlans -%}
+set interfaces {{ iface.name }} unit 0 family ethernet-switching vlan members vlan{{ v }}
+{% endfor %}
+{% endif %}
+{% if iface.bpduguard -%}
+set interfaces {{ iface.name }} unit 0 family ethernet-switching storm-control default
+{% endif %}
+{% if iface.shutdown -%}
+set interfaces {{ iface.name }} disable
+{% endif %}
+{% endfor %}"""
+
+VENDOR_TEMPLATES: dict[str, str] = {
+    "cisco_ios": _CISCO_IOS,
+    "arista_eos": _ARISTA_EOS,
+    "juniper_junos": _JUNIPER_JUNOS,
+}
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class InterfaceSpec:
+    """Vendor-neutral description of a single switchport."""
+    name: str
+    description: str
+    mode: str                                    # 'access' or 'trunk'
+    vlan: Optional[int] = None                   # access ports
+    native_vlan: int = 1                         # trunk ports
+    allowed_vlans: list[int] = field(default_factory=list)
+    portfast: bool = False
+    bpduguard: bool = False
+    shutdown: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("access", "trunk"):
+            raise ValueError(f"mode must be 'access' or 'trunk', got '{self.mode}'")
+        if self.mode == "access" and self.vlan is None:
+            raise ValueError(f"access port '{self.name}' requires a vlan")
+
+# ---------------------------------------------------------------------------
+# Generator
+# ---------------------------------------------------------------------------
+
+def generate_config(interfaces: list[InterfaceSpec], vendor: str) -> str:
+    """
+    Render switchport configuration for the target vendor.
+
+    Args:
+        interfaces: Ordered list of InterfaceSpec objects.
+        vendor:     'cisco_ios', 'arista_eos', or 'juniper_junos'.
+
+    Returns:
+        Rendered CLI configuration string.
+    """
+    if vendor not in VENDOR_TEMPLATES:
+        raise ValueError(
+            f"Unknown vendor '{vendor}'. Valid options: {sorted(VENDOR_TEMPLATES)}"
+        )
+    env = Environment(
+        loader=BaseLoader(),
+        undefined=StrictUndefined,
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    tmpl = env.from_string(VENDOR_TEMPLATES[vendor])
+    return tmpl.render(interfaces=[vars(i) for i in interfaces])
+
+# ---------------------------------------------------------------------------
+# Example
+# ---------------------------------------------------------------------------
+
+def _example_interfaces() -> list[InterfaceSpec]:
+    return [
+        InterfaceSpec(
+            name="GigabitEthernet0/1",
+            description="WORKSTATION-DESK-101",
+            mode="access",
+            vlan=10,
+            portfast=True,
+            bpduguard=True,
+        ),
+        InterfaceSpec(
+            name="GigabitEthernet0/2",
+            description="IP-PHONE-DESK-101",
+            mode="access",
+            vlan=20,
+            portfast=True,
+            bpduguard=True,
+        ),
+        InterfaceSpec(
+            name="GigabitEthernet0/3",
+            description="UNUSED-QUARANTINE",
+            mode="access",
+            vlan=999,
+            bpduguard=True,
+            shutdown=True,
+        ),
+        InterfaceSpec(
+            name="GigabitEthernet0/24",
+            description="UPLINK-CORE-SW01-Gi1/0/3",
+            mode="trunk",
+            native_vlan=999,
+            allowed_vlans=[10, 20, 30, 100],
+        ),
+    ]
+
+
+if __name__ == "__main__":
+    interfaces = _example_interfaces()
+    vendors = [sys.argv[1]] if len(sys.argv) > 1 else list(VENDOR_TEMPLATES)
+
+    for vendor in vendors:
+        bar = "=" * 62
+        print(f"\n{bar}")
+        print(f"  {vendor.upper().replace('_', ' ')}")
+        print(f"{bar}")
+        print(generate_config(interfaces, vendor))
