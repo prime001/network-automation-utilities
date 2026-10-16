@@ -1,0 +1,144 @@
+022_bgp_neighbor_parser.py - Parse Cisco BGP summary output into structured data.
+
+Parses `show ip bgp summary` (IOS/IOS-XE) and `show bgp ipv4 unicast summary`
+(NX-OS) output into structured JSON. Useful for bulk neighbor-state audits,
+health checks, and feeding downstream automation.
+
+Usage:
+    python 022_bgp_neighbor_parser.py --demo
+    python 022_bgp_neighbor_parser.py show_bgp.txt
+    python 022_bgp_neighbor_parser.py show_bgp.txt --json
+    cat show_bgp.txt | python 022_bgp_neighbor_parser.py
+"""
+
+import re
+import sys
+import json
+
+# Matches the neighbor data line in IOS/IOS-XE BGP summary output.
+# Columns: Neighbor  V  AS  MsgRcvd  MsgSent  TblVer  InQ  OutQ  Up/Down  State/PfxRcd
+_NEIGHBOR_RE = re.compile(
+    r'^(?P<neighbor>\d{1,3}(?:\.\d{1,3}){3})\s+'
+    r'\d+\s+'
+    r'(?P<remote_as>\d+)\s+'
+    r'\d+\s+\d+\s+'
+    r'\d+\s+'
+    r'\d+\s+\d+\s+'
+    r'(?P<uptime>\S+)\s+'
+    r'(?P<state_pfx>.+?)\s*$',
+    re.MULTILINE,
+)
+
+_LOCAL_AS_RE = re.compile(r'local AS number\s+(\d+)', re.IGNORECASE)
+_ROUTER_ID_RE = re.compile(r'BGP router identifier\s+([\d.]+)', re.IGNORECASE)
+
+SAMPLE_OUTPUT = """\
+BGP router identifier 10.0.0.1, local AS number 65000
+BGP table version is 150, main routing table version 150
+4 network entries using 592 bytes of memory
+
+Neighbor        V           AS MsgRcvd MsgSent   TblVer  InQ OutQ Up/Down  State/PfxRcd
+10.0.1.2        4        65001    1200    1180      150    0    0 1w2d            100
+10.0.1.6        4        65002     980     960      150    0    0 3d14h            75
+10.0.1.10       4        65003       0       0        0    0    0 never        Active
+192.168.100.1   4        65004       5       8        0    0    0 00:01:12  Idle (Admin)
+"""
+
+
+def parse_bgp_summary(text):
+    """
+    Parse raw BGP summary text into (meta, neighbors).
+
+    meta dict keys: router_id, local_as
+    neighbor dict keys: neighbor, remote_as, uptime, state, prefixes_received
+    """
+    meta = {
+        "router_id": None,
+        "local_as": None,
+    }
+
+    m = _ROUTER_ID_RE.search(text)
+    if m:
+        meta["router_id"] = m.group(1)
+
+    m = _LOCAL_AS_RE.search(text)
+    if m:
+        meta["local_as"] = m.group(1)
+
+    neighbors = []
+    for m in _NEIGHBOR_RE.finditer(text):
+        raw_state = m.group("state_pfx").strip()
+
+        if raw_state.isdigit():
+            state = "Established"
+            prefixes = int(raw_state)
+        else:
+            state = raw_state
+            prefixes = 0
+
+        neighbors.append({
+            "neighbor": m.group("neighbor"),
+            "remote_as": m.group("remote_as"),
+            "uptime": m.group("uptime"),
+            "state": state,
+            "prefixes_received": prefixes,
+        })
+
+    return meta, neighbors
+
+
+def print_summary(meta, neighbors):
+    """Print a compact health-check table to stdout."""
+    established = [n for n in neighbors if n["state"] == "Established"]
+    down = [n for n in neighbors if n["state"] != "Established"]
+
+    print(f"Router ID : {meta['router_id'] or 'unknown'}")
+    print(f"Local AS  : {meta['local_as'] or 'unknown'}")
+    print(f"Peers     : {len(neighbors)} total  |  {len(established)} up  |  {len(down)} down")
+    print()
+
+    if down:
+        print("  [DOWN]")
+        for n in down:
+            print(f"    {n['neighbor']:<18}  AS {n['remote_as']:<8}  {n['state']}")
+        print()
+
+    if established:
+        print("  [ESTABLISHED]")
+        for n in established:
+            print(
+                f"    {n['neighbor']:<18}  AS {n['remote_as']:<8}"
+                f"  pfx={n['prefixes_received']:<6}  up={n['uptime']}"
+            )
+
+
+def main():
+    args = sys.argv[1:]
+    use_json = "--json" in args
+    use_demo = "--demo" in args
+    file_args = [a for a in args if not a.startswith("--")]
+
+    if use_demo:
+        text = SAMPLE_OUTPUT
+    elif file_args:
+        with open(file_args[0]) as fh:
+            text = fh.read()
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read()
+    else:
+        print(
+            "Usage: python 022_bgp_neighbor_parser.py [file | --demo] [--json]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    meta, neighbors = parse_bgp_summary(text)
+
+    if use_json:
+        print(json.dumps({"meta": meta, "neighbors": neighbors}, indent=2))
+    else:
+        print_summary(meta, neighbors)
+
+
+if __name__ == "__main__":
+    main()
