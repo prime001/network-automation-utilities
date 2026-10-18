@@ -1,0 +1,251 @@
+{#
+  026_bgp_policy_template.j2
+
+  Generates complete BGP peering configuration for Cisco IOS/IOS-XE.
+  Covers peer groups, per-neighbor policies, prefix-lists, and route-maps
+  in a single pass — suitable for edge routers, route reflectors, and
+  multi-homed ISP peering scenarios.
+
+  Required top-level variables (YAML or Python dict):
+    device:
+      hostname: str        Router hostname (documentation only)
+      asn: int             Local AS number
+      router_id: str       BGP router-id (dotted-decimal IPv4)
+
+    peers: list
+      address: str         Neighbor IPv4 address
+      remote_as: int       Remote AS number
+      description: str     (optional) Neighbor description
+      peer_group: str      (optional) Assign to named peer group
+      password: str        (optional) MD5 auth password
+      update_source: str   (optional) Source interface (e.g. Loopback0)
+      ebgp_multihop: int   (optional) eBGP multihop TTL
+      next_hop_self: bool  (optional) Force next-hop-self in AF
+      soft_reconfiguration: bool  (optional, default true)
+      route_map_in: str    (optional) Inbound route-map name
+      route_map_out: str   (optional) Outbound route-map name
+      prefix_list_in: str  (optional) Inbound prefix-list name
+      prefix_list_out: str (optional) Outbound prefix-list name
+      shutdown: bool       (optional) Administratively shut neighbor
+
+  Optional top-level variables:
+    peer_groups: list      Reusable peer-group definitions (same keys
+                           as peers minus address/remote_as/peer_group)
+
+    networks: list
+      prefix: str          Network to advertise (e.g. 10.0.0.0)
+      mask: str            Subnet mask (e.g. 255.255.255.0)
+      route_map: str       (optional) Route-map applied on advertisement
+
+    prefix_lists: list
+      name: str
+      entries: list
+        seq: int
+        action: str        permit | deny
+        prefix: str        Prefix/len (e.g. 0.0.0.0/0)
+        ge: int            (optional) ge qualifier
+        le: int            (optional) le qualifier
+
+    route_maps: list
+      name: str
+      entries: list
+        seq: int
+        action: str        permit | deny
+        match: str         (optional) match clause (without "match" keyword)
+        set: str           (optional) set clause (without "set" keyword)
+
+  Example usage (Python):
+    from jinja2 import Environment, FileSystemLoader
+    import yaml
+
+    env = Environment(loader=FileSystemLoader('.'),
+                      trim_blocks=True, lstrip_blocks=True)
+    tmpl = env.get_template('026_bgp_policy_template.j2')
+    with open('site_bgp.yaml') as f:
+        print(tmpl.render(**yaml.safe_load(f)))
+
+  Minimal bgp_data.yaml:
+    device:
+      hostname: EDGE-RTR-01
+      asn: 65001
+      router_id: 10.0.0.1
+    peers:
+      - address: 203.0.113.1
+        remote_as: 64512
+        description: "ISP-A primary"
+        route_map_in:  RM-ISP-IN
+        route_map_out: RM-ISP-OUT
+        soft_reconfiguration: true
+    networks:
+      - prefix: 192.0.2.0
+        mask: 255.255.255.0
+    prefix_lists:
+      - name: PL-DEFAULT-ONLY
+        entries:
+          - seq: 5
+            action: permit
+            prefix: 0.0.0.0/0
+            ge: 0
+            le: 0
+          - seq: 10
+            action: deny
+            prefix: 0.0.0.0/0
+            le: 32
+    route_maps:
+      - name: RM-ISP-IN
+        entries:
+          - seq: 10
+            action: permit
+            match: "ip address prefix-list PL-DEFAULT-ONLY"
+            set:   "local-preference 150"
+          - seq: 20
+            action: deny
+      - name: RM-ISP-OUT
+        entries:
+          - seq: 10
+            action: permit
+            match: "ip address prefix-list PL-OWN-SPACE"
+          - seq: 20
+            action: deny
+#}
+
+{# ============================================================ #}
+{# Prefix-lists                                                  #}
+{# ============================================================ #}
+{% if prefix_lists is defined and prefix_lists %}
+! --- Prefix Lists ---
+{% for pl in prefix_lists %}
+{% for e in pl.entries %}
+ip prefix-list {{ pl.name }} seq {{ e.seq }} {{ e.action }} {{ e.prefix }}{% if e.ge is defined and e.ge is not none %} ge {{ e.ge }}{% endif %}{% if e.le is defined and e.le is not none %} le {{ e.le }}{% endif %}
+
+{% endfor %}
+{% endfor %}
+{% endif %}
+{# ============================================================ #}
+{# Route-maps                                                    #}
+{# ============================================================ #}
+{% if route_maps is defined and route_maps %}
+! --- Route Maps ---
+{% for rm in route_maps %}
+{% for e in rm.entries %}
+route-map {{ rm.name }} {{ e.action }} {{ e.seq }}
+{% if e.match is defined %}
+ match {{ e.match }}
+{% endif %}
+{% if e.set is defined %}
+ set {{ e.set }}
+{% endif %}
+!
+{% endfor %}
+{% endfor %}
+{% endif %}
+{# ============================================================ #}
+{# BGP process                                                   #}
+{# ============================================================ #}
+! --- BGP Configuration: {{ device.hostname }} AS {{ device.asn }} ---
+router bgp {{ device.asn }}
+ bgp router-id {{ device.router_id }}
+ bgp log-neighbor-changes
+ no bgp default ipv4-unicast
+{% if peer_groups is defined and peer_groups %}
+ !
+ ! Peer groups
+{% for pg in peer_groups %}
+ neighbor {{ pg.name }} peer-group
+{% if pg.remote_as is defined %}
+ neighbor {{ pg.name }} remote-as {{ pg.remote_as }}
+{% endif %}
+{% if pg.description is defined %}
+ neighbor {{ pg.name }} description {{ pg.description }}
+{% endif %}
+{% if pg.update_source is defined %}
+ neighbor {{ pg.name }} update-source {{ pg.update_source }}
+{% endif %}
+{% if pg.password is defined %}
+ neighbor {{ pg.name }} password {{ pg.password }}
+{% endif %}
+{% if pg.ebgp_multihop is defined %}
+ neighbor {{ pg.name }} ebgp-multihop {{ pg.ebgp_multihop }}
+{% endif %}
+{% endfor %}
+{% endif %}
+ !
+ ! Neighbors
+{% for peer in peers %}
+ neighbor {{ peer.address }} remote-as {{ peer.remote_as }}
+{% if peer.description is defined %}
+ neighbor {{ peer.address }} description {{ peer.description }}
+{% endif %}
+{% if peer.peer_group is defined %}
+ neighbor {{ peer.address }} peer-group {{ peer.peer_group }}
+{% endif %}
+{% if peer.password is defined %}
+ neighbor {{ peer.address }} password {{ peer.password }}
+{% endif %}
+{% if peer.update_source is defined %}
+ neighbor {{ peer.address }} update-source {{ peer.update_source }}
+{% endif %}
+{% if peer.ebgp_multihop is defined %}
+ neighbor {{ peer.address }} ebgp-multihop {{ peer.ebgp_multihop }}
+{% endif %}
+{% if peer.shutdown is defined and peer.shutdown %}
+ neighbor {{ peer.address }} shutdown
+{% endif %}
+{% endfor %}
+ !
+ address-family ipv4
+{% if networks is defined and networks %}
+  ! Originated prefixes
+{% for net in networks %}
+  network {{ net.prefix }} mask {{ net.mask }}{% if net.route_map is defined %} route-map {{ net.route_map }}{% endif %}
+
+{% endfor %}
+{% endif %}
+{% if peer_groups is defined and peer_groups %}
+  ! Peer group AF activation
+{% for pg in peer_groups %}
+  neighbor {{ pg.name }} activate
+{% if pg.next_hop_self is defined and pg.next_hop_self %}
+  neighbor {{ pg.name }} next-hop-self
+{% endif %}
+{% if pg.route_map_in is defined %}
+  neighbor {{ pg.name }} route-map {{ pg.route_map_in }} in
+{% endif %}
+{% if pg.route_map_out is defined %}
+  neighbor {{ pg.name }} route-map {{ pg.route_map_out }} out
+{% endif %}
+{% if pg.prefix_list_in is defined %}
+  neighbor {{ pg.name }} prefix-list {{ pg.prefix_list_in }} in
+{% endif %}
+{% if pg.prefix_list_out is defined %}
+  neighbor {{ pg.name }} prefix-list {{ pg.prefix_list_out }} out
+{% endif %}
+{% endfor %}
+{% endif %}
+  ! Per-neighbor AF policies
+{% for peer in peers %}
+{% if peer.peer_group is not defined %}
+  neighbor {{ peer.address }} activate
+{% if peer.soft_reconfiguration is not defined or peer.soft_reconfiguration %}
+  neighbor {{ peer.address }} soft-reconfiguration inbound
+{% endif %}
+{% if peer.next_hop_self is defined and peer.next_hop_self %}
+  neighbor {{ peer.address }} next-hop-self
+{% endif %}
+{% if peer.route_map_in is defined %}
+  neighbor {{ peer.address }} route-map {{ peer.route_map_in }} in
+{% endif %}
+{% if peer.route_map_out is defined %}
+  neighbor {{ peer.address }} route-map {{ peer.route_map_out }} out
+{% endif %}
+{% if peer.prefix_list_in is defined %}
+  neighbor {{ peer.address }} prefix-list {{ peer.prefix_list_in }} in
+{% endif %}
+{% if peer.prefix_list_out is defined %}
+  neighbor {{ peer.address }} prefix-list {{ peer.prefix_list_out }} out
+{% endif %}
+{% endif %}
+{% endfor %}
+ exit-address-family
+!
+end
