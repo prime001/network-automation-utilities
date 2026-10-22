@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+Syslog Message Parser and Analyzer
+
+Parses syslog messages (RFC 3164 and RFC 5424), extracts metadata,
+filters by severity/facility, and generates statistical reports.
+
+Useful for:
+- Device log analysis and troubleshooting
+- Security event filtering and triage
+- Compliance auditing and forensics
+- Alert threshold analysis
+"""
+
+import re
+import json
+from datetime import datetime
+from collections import defaultdict
+from typing import List, Dict, Optional
+
+
+class SyslogParser:
+    """Parse and analyze syslog messages from network devices."""
+    
+    # RFC 3164 / RFC 5424 severity levels
+    SEVERITY_MAP = {
+        0: "emerg", 1: "alert", 2: "crit", 3: "err",
+        4: "warning", 5: "notice", 6: "info", 7: "debug"
+    }
+    
+    # Facility codes for network devices
+    FACILITY_MAP = {
+        0: "kernel", 3: "daemon", 4: "auth", 5: "syslog",
+        16: "local0", 17: "local1", 18: "local2", 19: "local3",
+        20: "local4", 21: "local5", 22: "local6", 23: "local7"
+    }
+    
+    # Regex patterns for RFC 3164 (standard) and RFC 5424 (newer) formats
+    RFC3164_PATTERN = r'^(\w+\s+\d+\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(\S+?(?:\[\d+\])?):?\s+(.+)$'
+    RFC5424_PATTERN = r'^<(\d+)>(\d+)\s+([\dT:.+-]+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$'
+    
+    def __init__(self):
+        self.messages: List[Dict] = []
+        self.stats = defaultdict(int)
+    
+    def parse_line(self, line: str) -> Dict:
+        """Parse a single syslog line and return structured message metadata."""
+        if not line or line.startswith('#'):
+            return {'parsed': False}
+        
+        # Try RFC 5424 (structured) format first
+        match = re.match(self.RFC5424_PATTERN, line)
+        if match:
+            pri, version, timestamp, hostname, app, procid, content = match.groups()
+            facility = int(pri) // 8
+            severity = int(pri) % 8
+            return {
+                'timestamp': timestamp,
+                'hostname': hostname,
+                'app': app,
+                'procid': procid,
+                'severity': self.SEVERITY_MAP.get(severity, f'unknown({severity})'),
+                'facility': self.FACILITY_MAP.get(facility, f'unknown({facility})'),
+                'message': content,
+                'format': 'RFC5424',
+                'parsed': True
+            }
+        
+        # Fall back to RFC 3164 (traditional) format
+        match = re.match(self.RFC3164_PATTERN, line)
+        if match:
+            timestamp, hostname, tag, message = match.groups()
+            # Extract priority from tag if present (Cisco format: <PRI>tag)
+            pri_match = re.match(r'^<(\d+)>(\w+)', tag)
+            if pri_match:
+                pri, tag = pri_match.groups()
+                facility, severity = int(pri) // 8, int(pri) % 8
+            else:
+                facility, severity = 1, 6  # default: user/info
+            
+            return {
+                'timestamp': timestamp,
+                'hostname': hostname,
+                'tag': tag,
+                'severity': self.SEVERITY_MAP.get(severity, f'unknown({severity})'),
+                'facility': self.FACILITY_MAP.get(facility, f'unknown({facility})'),
+                'message': message,
+                'format': 'RFC3164',
+                'parsed': True
+            }
+        
+        return {'parsed': False}
+    
+    def parse_file(self, filename: str) -> int:
+        """Parse all syslog lines from a file. Returns count of parsed messages."""
+        with open(filename, 'r') as f:
+            for line in f:
+                msg = self.parse_line(line.strip())
+                self.messages.append(msg)
+                if msg.get('parsed'):
+                    self.stats['total_parsed'] += 1
+                    self.stats[('severity', msg['severity'])] += 1
+                    self.stats[('facility', msg['facility'])] += 1
+        
+        return self.stats['total_parsed']
+    
+    def filter_by_severity(self, severity_name: str) -> List[Dict]:
+        """Return messages at or above given severity level."""
+        severity_rank = {v: k for k, v in self.SEVERITY_MAP.items()}
+        threshold = severity_rank.get(severity_name, 7)
+        return [m for m in self.messages 
+                if m.get('parsed') and 
+                severity_rank.get(m['severity'], 7) <= threshold]
+    
+    def filter_by_hostname(self, hostname: str) -> List[Dict]:
+        """Return messages from a specific device hostname."""
+        return [m for m in self.messages if m.get('hostname') == hostname]
+    
+    def get_summary(self) -> Dict:
+        """Generate summary statistics across all parsed messages."""
+        parsed_count = sum(1 for m in self.messages if m.get('parsed'))
+        severity_counts = {sev: sum(1 for m in self.messages if m.get('severity') == sev)
+                          for sev in self.SEVERITY_MAP.values()}
+        
+        return {
+            'total_messages': len(self.messages),
+            'parsed_messages': parsed_count,
+            'unparseable_messages': len(self.messages) - parsed_count,
+            'unique_hosts': len(set(m.get('hostname') for m in self.messages if m.get('parsed'))),
+            'severity_breakdown': {k: v for k, v in severity_counts.items() if v > 0},
+            'critical_alerts': sum(1 for m in self.messages 
+                                  if m.get('severity') in ['emerg', 'alert', 'crit'])
+        }
+    
+    def export_json(self, filename: str):
+        """Export parsed messages and summary to JSON file."""
+        export_data = {
+            'summary': self.get_summary(),
+            'messages': [m for m in self.messages if m.get('parsed')]
+        }
+        with open(filename, 'w') as f:
+            json.dump(export_data, f, indent=2)
+
+
+# Example usage and smoke test
+if __name__ == '__main__':
+    # Create sample syslog file
+    sample_syslog = """<134>1 2024-01-15T10:30:45Z router1 ospf 1234 - New route learned: 10.0.0.0/24
+<131>1 2024-01-15T10:31:12Z switch1 kernel - Interface Eth1 down
+<129>1 2024-01-15T10:32:03Z firewall1 acl 9999 - DROP: 203.0.113.5:54321 -> 10.0.0.1:443
+Jan 15 10:34:22 router2 kernel: Interface FastEthernet0/0 changed state to up
+Jan 15 10:35:10 switch2 <134>OSPF-5-ADJCHG: OSPF: Nbr 10.0.0.2 on GigabitEthernet0/1 from LOADING to FULL
+# This is a comment - should be ignored
+Jan 15 10:36:45 fw-prod syslog: User admin logged in from 203.0.113.100
+"""
+    
+    # Parse sample data
+    with open('/tmp/sample_syslog.log', 'w') as f:
+        f.write(sample_syslog)
+    
+    parser = SyslogParser()
+    parsed = parser.parse_file('/tmp/sample_syslog.log')
+    
+    print(f"Parsed {parsed} syslog messages\n")
+    
+    summary = parser.get_summary()
+    print("Summary Statistics:")
+    print(f"  Total: {summary['total_messages']}")
+    print(f"  Parsed: {summary['parsed_messages']}")
+    print(f"  Unique Hosts: {summary['unique_hosts']}")
+    print(f"  Critical Alerts: {summary['critical_alerts']}\n")
+    
+    print("Severity Breakdown:")
+    for severity, count in sorted(summary['severity_breakdown'].items()):
+        print(f"  {severity}: {count}")
+    
+    critical = parser.filter_by_severity('crit')
+    print(f"\nCritical & Above ({len(critical)} messages):")
+    for msg in critical:
+        print(f"  [{msg['severity']}] {msg.get('hostname')}: {msg['message'][:60]}")
+    
+    parser.export_json('/tmp/syslog_analysis.json')
+    print("\nDetailed analysis exported to /tmp/syslog_analysis.json")
